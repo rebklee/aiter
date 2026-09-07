@@ -25,7 +25,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Use our minimal bench (avoids persistent_jtile_kernels_hip.hpp missing in this commit).
 BENCH_SRC="${SCRIPT_DIR}/ck_bench_warp_decode.cpp"
 BENCH_BIN="${WORKTREE_DIR}/bench_ck_warp_decode"
-AMDCLANG="/opt/rocm/bin/amdclang++"
+AMDCLANG="/opt/venv/bin/amdclang++"
 
 # ── 1. GPU arch ──────────────────────────────────────────────────────────────
 if [ -n "${1:-}" ]; then
