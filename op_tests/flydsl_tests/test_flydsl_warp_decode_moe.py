@@ -29,15 +29,13 @@ import argparse
 import pytest
 import torch
 
-from aiter.ops.flydsl.utils import is_flydsl_available
-
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
-if not is_flydsl_available():
-    pytest.skip(
-        "flydsl is not installed. Skipping FlyDSL warp-decode tests.",
-        allow_module_level=True,
-    )
+pytest.importorskip(
+    "aiter.ops.flydsl",
+    reason="flydsl is not installed. Skipping FlyDSL warp-decode tests.",
+    exc_type=ImportError,
+)
 
 import flydsl.compiler as flyc  # noqa: E402
 import pandas as pd  # noqa: E402
