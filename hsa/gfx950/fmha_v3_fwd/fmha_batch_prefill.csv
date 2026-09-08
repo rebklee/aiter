@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Assembly batch-prefill kernels with a statically compiled KV-cache page size.
+// page_size is deliberately absent from the dense fmha_fwd.csv schema: the
+// generic HSA manifest generator supplies 0 for configurations where it is not
+// applicable.
+dtype,hdim_q,hdim_v,mask,page_size,kv_layout,lookup_table,qscale,ts_qo,bdx,abi,grid_layout,knl_name,co_name
+bf16,128,128,2,64,linear,sglang,no,256,512,paged_varlen_v3_reuse,heads_batch_qtiles,bf16_fmha_prefill_gfx950_hd128_ps64_causal_group,fwd_hd128_bf16_causal_paged_varlen.co
+fp8bf16,256,256,0,64,linear,sglang,pertensor,256,512,paged_varlen_v3_ext,qtiles_heads_batch,_ZN5aiter38fmha_fwd_hd256_fp8_paged_varlen_gfx950E,fwd_hd256_fp8_paged_varlen.co
+fp8bf16,256,256,2,64,linear,sglang,pertensor,256,512,paged_varlen_v3_ext,qtiles_heads_batch,_ZN5aiter45fmha_fwd_hd256_fp8_causal_paged_varlen_gfx950E,fwd_hd256_fp8_causal_paged_varlen.co
