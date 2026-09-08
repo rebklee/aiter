@@ -654,6 +654,29 @@ _SEG_TARGET_COUNT = 16
 _SEG_MAX_CHUNKS = 64
 _SEG_MIN_DEPTH = 256
 
+_SCAN_BV_NARROW = 16
+_SCAN_BV_WIDE = 32
+
+
+def _scan_bv(n_seqs: int, H: int, V: int) -> tuple[int, int]:
+    """``(BV, num_warps)`` for the cross-segment scan.
+
+    The grid is ``cdiv(V, BV) * n_seqs * H``, so a narrower BV buys blocks -- but
+    every block re-reads the whole ``A_seg[K, K]`` of each segment it walks, so
+    halving BV doubles that traffic for twice the blocks. BV=16 is where the two
+    balance, and not marginally: BV=8 loses 1.4-2.8x on every (n_seqs, H)
+    measured, so this is not a "fill the CUs" decision and going narrower than 16
+    is never right. The only question left is whether BV=16 overshoots the
+    device, and past that point the wider tile is cheaper than the extra reads.
+
+    Measured on MI355 (256 CUs) at V=128, against BV=32: 1.94x at n_seqs*H=4,
+    1.28x at 12, 1.07x at 32, and at 48 -- where BV=16 would ask for 384 blocks
+    -- BV=32 wins by 1.07x instead.
+    """
+    if (V // _SCAN_BV_NARROW) * n_seqs * H > _num_cus():
+        return _SCAN_BV_WIDE, 2
+    return _SCAN_BV_NARROW, 4
+
 
 def _choose_chunks_per_seg(n_chunks_max: int, n_seqs: int, H: int, V: int) -> int:
     """Segment length in chunks, or ``n_chunks_max`` to disable segmentation.
@@ -1003,7 +1026,7 @@ def flash_kda_fwd(
 
         # Pass B: propagate across segments. Depth is the segment count.
         h_in = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
-        BV_SCAN = 32
+        BV_SCAN, SCAN_WARPS = _scan_bv(N, H, V)
         _flash_kda_seg_scan_kernel[(triton.cdiv(V, BV_SCAN), N * H)](
             A_seg=A_seg,
             b_seg=b_seg,
@@ -1014,7 +1037,7 @@ def flash_kda_fwd(
             K=K,
             V=V,
             BV=BV_SCAN,
-            num_warps=4,
+            num_warps=SCAN_WARPS,
         )
     else:
         h_in = h0
