@@ -74,6 +74,17 @@ CHUNK_DELTA_ATTN_USE_FLASH_KDA: bool = os.getenv(
     "CHUNK_DELTA_ATTN_USE_FLASH_KDA", "1"
 ).lower() in ("1", "true", "yes", "on")
 
+# Off by default: routes K1 and/or K2 to the Gluon transcriptions under
+# _gluon_kernels. "1" takes both, "k1" or "k2" takes one, which is what
+# attributes an end-to-end change to a single kernel. Both are fixed to C == 32
+# and K == 128 by the layouts they transcribe, so each is gated per call and
+# anything else still runs the Triton kernel; the two write the same ABI, so
+# neither side knows which one ran.
+_GLUON_SEL: str = os.getenv("AITER_FLASH_KDA_USE_GLUON", "0").lower()
+_GLUON_BOTH: bool = _GLUON_SEL in ("1", "true", "yes", "on", "all")
+AITER_FLASH_KDA_USE_GLUON_K1: bool = _GLUON_BOTH or _GLUON_SEL == "k1"
+AITER_FLASH_KDA_USE_GLUON_K2: bool = _GLUON_BOTH or _GLUON_SEL == "k2"
+
 # The K-dimension is consumed as two 64-wide halves so the recurrent state fits
 # a pair of [64, BW] register tiles in K2. Relaxing this means reworking K2's
 # state blocking, not just the loop bound.
@@ -604,6 +615,36 @@ def flash_kda_supported(
     )
 
 
+def _gluon_k1_usable(C: int, K: int) -> bool:
+    """Whether the Gluon K1 can stand in for the Triton one on this call.
+
+    Only the tile shape is left: the kernel asserts C == 32 and K == 128 because
+    its layouts are transcribed at that shape, and neither is reachable from the
+    other by a constexpr. Varlen, short trailing chunks and a missing dt_bias
+    are all handled. Kept here rather than in that module so deciding costs no
+    gluon import.
+    """
+    return C == FLASH_KDA_CHUNK and K == FLASH_KDA_K
+
+
+def _gluon_k2_usable(C: int, K: int, V: int) -> bool:
+    """Whether the Gluon K2 can stand in for the Triton one on this call."""
+    return C == FLASH_KDA_CHUNK and K == FLASH_KDA_K and V == FLASH_KDA_K
+
+
+def _choose_k2_bw(W: int, num_segs: int, H: int) -> int:
+    """BW for the Gluon K2, which does not autotune.
+
+    BW fixes both the state's register footprint and the wave count, and at
+    equal columns per wave the warp split barely matters, so this is really only
+    choosing between 16 columns per wave and 32. The narrow one wins unless the
+    grid is wide enough that the wider tile still fills the device.
+    """
+    if W % 64 == 0 and (W // 64) * num_segs * H >= 2 * _num_cus():
+        return 64
+    return 32
+
+
 @functools.cache
 def _num_cus(device_index: int = 0) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
@@ -781,32 +822,65 @@ def flash_kda_fwd(
     # here for the same reason.
     ws_inv_mqk = torch.empty(H * total_tiles, 2 * C, C, dtype=torch.float16, device=dev)
 
-    _flash_kda_prepare_kernel[(total_tiles if cu_seqlens is not None else NT, B * H)](
-        q=q,
-        k=k,
-        g_raw=g,
-        beta_raw=beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        ws_kd=ws_kd,
-        ws_qd=ws_qd,
-        ws_kr=ws_kr,
-        ws_gt=ws_gt,
-        ws_inv_mqk=ws_inv_mqk,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        scale=scale,
-        lower_bound=lower_bound,
-        T=T,
-        NT=NT,
-        TOTAL_TILES=total_tiles,
-        H=H,
-        K=K,
-        C=C,
-        BC=inv_block,
-        NUM_DOUBLING=inv_block.bit_length() - 2,
-        NUM_MERGE=(C // inv_block).bit_length() - 1,
-    )
+    if AITER_FLASH_KDA_USE_GLUON_K1 and _gluon_k1_usable(C, K):
+        from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn.flash_kda_k1 import (
+            gluon_k1_prepare,
+        )
+
+        gluon_k1_prepare(
+            q=q,
+            k=k,
+            g_raw=g,
+            beta_raw=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            ws_kd=ws_kd,
+            ws_qd=ws_qd,
+            ws_kr=ws_kr,
+            ws_gt=ws_gt,
+            ws_inv_mqk=ws_inv_mqk,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            scale=scale,
+            lower_bound=lower_bound,
+            T=T,
+            NT=NT,
+            TOTAL_TILES=total_tiles,
+            H=H,
+            K=K,
+            C=C,
+            BC=inv_block,
+            B=B,
+        )
+    else:
+        _flash_kda_prepare_kernel[
+            (total_tiles if cu_seqlens is not None else NT, B * H)
+        ](
+            q=q,
+            k=k,
+            g_raw=g,
+            beta_raw=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            ws_kd=ws_kd,
+            ws_qd=ws_qd,
+            ws_kr=ws_kr,
+            ws_gt=ws_gt,
+            ws_inv_mqk=ws_inv_mqk,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            scale=scale,
+            lower_bound=lower_bound,
+            T=T,
+            NT=NT,
+            TOTAL_TILES=total_tiles,
+            H=H,
+            K=K,
+            C=C,
+            BC=inv_block,
+            NUM_DOUBLING=inv_block.bit_length() - 2,
+            NUM_MERGE=(C // inv_block).bit_length() - 1,
+        )
 
     if cu_seqlens is not None:
         seqs = _seq_bounds(cu_seqlens)
@@ -861,32 +935,71 @@ def flash_kda_fwd(
         "STATE_V_FIRST": state_v_first,
     }
 
+    # Only pass A goes to Gluon. Its two launches differ solely in seeding, so
+    # keeping the state in registers lets one launch do both and share every
+    # operand load, which is worth 1.3-1.7x. Pass C has nothing to fuse with,
+    # and there the register-resident state is at best a wash: it cannot be
+    # warp-split along K, so its wave count is capped at ``W/16 * num_segs * H``
+    # and an unsegmented shape ends up with half the parallelism Triton gets.
+    use_gluon_k2 = AITER_FLASH_KDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
+
+    def _launch_k2(*, W, **kw):
+        return _flash_kda_segment_kernel[
+            lambda meta, _w=W: (triton.cdiv(_w, meta["BW"]), num_segs * H)
+        ](W=W, **common, **kw)
+
     if max_segs > 1:
         # Pass A: b_seg (affine part) and A_seg (linear part), both fully
         # parallel across segments. Neither writes outputs.
         b_seg = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
         A_seg = torch.empty(num_segs, H, K, K, dtype=torch.bfloat16, device=dev)
-        for buf, width, identity, has_v in (
-            (b_seg, V, False, True),
-            (A_seg, K, True, False),
-        ):
-            _flash_kda_segment_kernel[
-                lambda meta, _w=width: (triton.cdiv(_w, meta["BW"]), num_segs * H)
-            ](
+        if use_gluon_k2:
+            from ..._gluon_kernels.gfx950.chunk_delta_attn import flash_kda_k2 as _g2
+
+            bw = _choose_k2_bw(V, num_segs, H)
+            nw = _g2.BW_WARPS[bw]
+            _g2.k2_ab_fused_gluon[(triton.cdiv(V, bw), num_segs * H)](
+                ws_kd=ws_kd,
+                ws_kr=ws_kr,
+                ws_gt=ws_gt,
+                ws_inv_mqk=ws_inv_mqk,
                 v_input=v,
-                out=None,
-                h_in=None,
-                h_out=buf,
-                final_state=None,
-                W=width,
-                INIT_IDENTITY=identity,
-                HAS_H_IN=False,
-                HAS_V=has_v,
-                COMPUTE_OUTPUT=False,
-                STORE_H_OUT=True,
-                STORE_FINAL=False,
-                **common,
+                beta_raw=beta,
+                h_out_b=b_seg,
+                h_out_a=A_seg,
+                seg_chunk_base=seg_chunk_base,
+                seg_nchunks=seg_nchunks,
+                seg_tok_base=seg_tok_base,
+                seg_tok_end=seg_tok_end,
+                TOTAL_TILES=total_tiles,
+                H=H,
+                K=K,
+                V=V,
+                C=C,
+                BW=bw,
+                **_g2.build_layouts(nw),
+                num_warps=nw,
+                num_stages=1,
             )
+        else:
+            for buf, width, identity, has_v in (
+                (b_seg, V, False, True),
+                (A_seg, K, True, False),
+            ):
+                _launch_k2(
+                    v_input=v,
+                    out=None,
+                    h_in=None,
+                    h_out=buf,
+                    final_state=None,
+                    W=width,
+                    INIT_IDENTITY=identity,
+                    HAS_H_IN=False,
+                    HAS_V=has_v,
+                    COMPUTE_OUTPUT=False,
+                    STORE_H_OUT=True,
+                    STORE_FINAL=False,
+                )
 
         # Pass B: propagate across segments. Depth is the segment count.
         h_in = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
@@ -907,7 +1020,7 @@ def flash_kda_fwd(
         h_in = h0
 
     # Pass C: re-run each segment from its true incoming state, writing outputs.
-    _flash_kda_segment_kernel[lambda meta: (triton.cdiv(V, meta["BW"]), num_segs * H)](
+    _launch_k2(
         v_input=v,
         out=o,
         h_in=h_in,
@@ -920,7 +1033,6 @@ def flash_kda_fwd(
         COMPUTE_OUTPUT=True,
         STORE_H_OUT=False,
         STORE_FINAL=output_final_state,
-        **common,
     )
 
     return o, final_state
