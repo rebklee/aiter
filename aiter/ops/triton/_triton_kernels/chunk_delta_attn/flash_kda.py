@@ -318,23 +318,43 @@ def _flash_kda_prepare_kernel(
     tl.store(ws_inv_mqk + cc_off, b_INV)
 
 
-# K2 keeps three configs even with the global autotune flag off, where the other
-# kernels here fall back to one. Its parallelism is only num_segments * H *
-# (W / BW), so the best BW swings with head count: a pinned BW=32 costs ~1.4x at
-# H=16 and turns the path into a regression against the default pipeline. Three
-# configs is a cheap first-call sweep, and the result is cached.
+# K2 keeps a config list even with the global autotune flag off, where the other
+# kernels here fall back to one. Two things move with the shape and pull in
+# opposite directions, so no single BW is close to right across the sweep:
+#
+#   * Parallelism is only ``num_segments * H * cdiv(W, BW)``, so a wide BW can
+#     leave the device idle -- at one segment per sequence BW=64 gets a quarter
+#     of the blocks BW=16 does, and picking 64 there costs 2.3x.
+#   * The per-chunk workspace (kd/qd/kr/inv/mqk, ~28 KB) is read in full by
+#     every block regardless of BW, so cdiv(W, BW) blocks read it that many
+#     times over. BW=128 reads it once.
+#
+# Whichever binds is set by the block count against the CU count, which is why
+# the winners below are spread across the whole BW range: BW=128 at H=12 (192
+# blocks, bandwidth-bound), BW=64 at H=16, BW=32 at H=64 (256 blocks, occupancy
+# -bound). Restricted to the old {16, 32, 64@nw=4} the tuner gives up 29% of K2
+# at H=12 and 43% at H=16, so the extra first-call sweep pays for itself; the
+# result is cached on disk.
+#
+# num_warps matters as much as BW and is the reason the old list was so far off:
+# at BW=64 the same kernel runs 1.4x (pass A) and 1.9x (pass C) slower at nw=4
+# than at nw=2, so listing 64 only at nw=4 put the good schedule out of reach
+# and left the tuner falling back to BW=32.
 _K2_CONFIGS: list = (
     [
         triton.Config({"BW": BW}, num_warps=nw, num_stages=ns)
-        for BW in [16, 32, 64]
+        for BW in [16, 32, 64, 128]
         for nw in [2, 4]
-        for ns in [1, 2]
+        for ns in [1, 2, 3]
     ]
     if CHUNK_DELTA_ATTN_TRITON_AUTOTUNE
     else [
         triton.Config({"BW": 16}, num_warps=2, num_stages=2),
         triton.Config({"BW": 32}, num_warps=2, num_stages=2),
-        triton.Config({"BW": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BW": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BW": 64}, num_warps=2, num_stages=3),
+        triton.Config({"BW": 128}, num_warps=2, num_stages=2),
+        triton.Config({"BW": 128}, num_warps=4, num_stages=2),
     ]
 )
 
