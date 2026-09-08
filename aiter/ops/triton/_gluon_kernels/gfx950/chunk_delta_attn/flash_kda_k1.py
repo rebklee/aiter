@@ -1,6 +1,8 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.fast_launch import fast_launch
+
 _BLK_WARP_K: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 2], [1, 0])
 _BLK1: gl.constexpr = gl.BlockedLayout([1], [64], [2], [0])
 _BLK_CC: gl.constexpr = gl.BlockedLayout([1, 1], [4, 16], [2, 1], [1, 0])
@@ -88,6 +90,8 @@ def k1_prepare_gluon(
     BC: gl.constexpr,
     IS_VARLEN: gl.constexpr,
     HAS_BIAS: gl.constexpr,
+    CM_WS: gl.constexpr = "",
+    CM_LOAD: gl.constexpr = ".cg",
 ):
     gl.static_assert(C == 32 and K == 128)
     NUM_DOUBLING: gl.constexpr = BC.bit_length() - 2
@@ -131,10 +135,10 @@ def k1_prepare_gluon(
     )
 
     b_q_raw = gl.amd.cdna4.buffer_load(
-        ptr=q, offsets=qk_off, mask=m_ck, other=0.0, cache=".cg"
+        ptr=q, offsets=qk_off, mask=m_ck, other=0.0, cache=CM_LOAD
     )
     b_k_raw = gl.amd.cdna4.buffer_load(
-        ptr=k, offsets=qk_off, mask=m_ck, other=0.0, cache=".cg"
+        ptr=k, offsets=qk_off, mask=m_ck, other=0.0, cache=CM_LOAD
     )
     if HAS_BIAS:
         bias = gl.amd.cdna4.buffer_load(
@@ -142,7 +146,7 @@ def k1_prepare_gluon(
         )[None, :]
 
     b_g = gl.amd.cdna4.buffer_load(
-        ptr=g_raw, offsets=qk_off, mask=m_ck, other=0.0, cache=".cg"
+        ptr=g_raw, offsets=qk_off, mask=m_ck, other=0.0, cache=CM_LOAD
     ).to(gl.float32)
     if HAS_BIAS:
         b_g = b_g + bias
@@ -164,19 +168,28 @@ def k1_prepare_gluon(
         gl.int32
     )
     gl.amd.cdna4.buffer_store(
-        gl.where(m_ck, b_k * b_exp_g, 0.0).to(ws_kd.dtype.element_ty), ws_kd, ck_off
+        gl.where(m_ck, b_k * b_exp_g, 0.0).to(ws_kd.dtype.element_ty),
+        ws_kd,
+        ck_off,
+        cache=CM_WS,
     )
     gl.amd.cdna4.buffer_store(
         gl.where(m_ck, b_q * b_exp_g * scale, 0.0).to(ws_qd.dtype.element_ty),
         ws_qd,
         ck_off,
+        cache=CM_WS,
     )
     b_kr_val = gl.where(m_ck, b_k * _exp2(b_g_last[None, :] - b_gcum), 0.0).to(
         gl.bfloat16
     )
-    gl.amd.cdna4.buffer_store(b_kr_val.to(ws_kr.dtype.element_ty), ws_kr, ck_off)
     gl.amd.cdna4.buffer_store(
-        gl.convert_layout(b_g_total, _BLK1), ws_gt, (ws_idx * K).to(gl.int32) + o_k_v
+        b_kr_val.to(ws_kr.dtype.element_ty), ws_kr, ck_off, cache=CM_WS
+    )
+    gl.amd.cdna4.buffer_store(
+        gl.convert_layout(b_g_total, _BLK1),
+        ws_gt,
+        (ws_idx * K).to(gl.int32) + o_k_v,
+        cache=CM_WS,
     )
 
     b_beta = _sigmoid(
@@ -222,6 +235,7 @@ def k1_prepare_gluon(
         gl.convert_layout(b_Mqk.to(ws_inv_mqk.dtype.element_ty), _BLK_CC),
         ws_inv_mqk,
         cc_off_raw + C * C,
+        cache=CM_WS,
     )
 
     if BC == C:
@@ -254,11 +268,15 @@ def k1_prepare_gluon(
         gl.convert_layout(b_INV.to(ws_inv_mqk.dtype.element_ty), _BLK_CC),
         ws_inv_mqk,
         cc_off_raw,
+        cache=CM_WS,
     )
 
 
 _NUM_WARPS = 2
 _NUM_STAGES = 1
+
+
+_k1_fast = fast_launch(k1_prepare_gluon)
 
 
 def gluon_k1_prepare(
@@ -285,8 +303,10 @@ def gluon_k1_prepare(
     C,
     BC,
     B,
+    CM_WS="",
+    CM_LOAD=".cg",
 ):
-    return k1_prepare_gluon[(TOTAL_TILES if cu_seqlens is not None else NT, B * H)](
+    return _k1_fast[(TOTAL_TILES if cu_seqlens is not None else NT, B * H)](
         q=q,
         k=k,
         g_raw=g_raw,
@@ -311,6 +331,8 @@ def gluon_k1_prepare(
         BC=BC,
         IS_VARLEN=cu_seqlens is not None,
         HAS_BIAS=dt_bias is not None,
+        CM_WS=CM_WS,
+        CM_LOAD=CM_LOAD,
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )

@@ -29,6 +29,8 @@ kernel gets from its LDS round-trip, and it measures 2x slower.
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.fast_launch import fast_launch
+
 # BW -> num_warps. The state is the B operand of dot(kd, h), whose contraction
 # axis is the state's K axis, so the warps can only split BW, and BW has to be a
 # multiple of 16 * num_warps for that split to divide rather than duplicate.
@@ -412,3 +414,7 @@ def k2_ab_fused_gluon(
     s_off = (o_k_m[:, None] * V + o_w_m[None, :]).to(gl.int32)
     gl.amd.cdna4.buffer_store(h_b.to(h_out_b.dtype.element_ty), h_out_b + s_base, s_off)
     gl.amd.cdna4.buffer_store(h_a.to(h_out_a.dtype.element_ty), h_out_a + s_base, s_off)
+
+
+# Launched through the shape cache; see fast_launch.py for why.
+k2_ab_fused_fast = fast_launch(k2_ab_fused_gluon)
