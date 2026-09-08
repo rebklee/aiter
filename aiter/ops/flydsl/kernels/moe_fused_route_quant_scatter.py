@@ -58,6 +58,7 @@ Grid  : (ceil(numel / warps_per_block), 1, 1)   numel = token_num*topk
 Block : (BLOCK_THREADS, 1, 1)
 """
 
+import os
 from types import SimpleNamespace
 
 import flydsl.compiler as flyc
@@ -94,6 +95,28 @@ BLOCK_THREADS = 256
 SCALE_RSRC_MAX_BYTES = 0x7FFFFFFF
 ELEMS_PER_LANE = 2  # bf16 columns each lane quantizes -> 1 fp4 byte / 2 fp8 bytes
 LANES_PER_MX_BLOCK = 32 // ELEMS_PER_LANE  # 16 lanes cover one 32-element MX block
+
+# Write one compact row per source token instead of one grouped row per route.
+# With topk=6 the scattered form stores every token's payload six times and its
+# scale sixteen times over (4 useful bytes per 64 B line), which is what makes
+# this kernel bandwidth-bound. Compact form writes each once, row-major, and
+# leaves it to the GEMM to gather rows via route -> token. Only the fused
+# multi-destination path honours this; the GEMM side must match, so it is
+# opt-in.
+_COMPACT_A = os.environ.get("AITER_COMPACT_A", "0") == "1"
+
+# The two halves cost very different amounts to consume. A compact payload only
+# needs the GEMM to gather by a different row index; a compact scale also needs
+# a different LDS layout there, since the scattered form is WMMA-interleaved.
+# Compacting the payload alone is therefore a usable intermediate, and the gap
+# between the two says what the harder half is worth.
+_COMPACT_SCALE = _COMPACT_A and os.environ.get("AITER_COMPACT_SCALE", "1") == "1"
+
+# Store each payload as soon as it is converted rather than holding every
+# block_iters result live until the store pass. Unset means "decide per
+# destination count" (see _emit_quant_block_loop); set it to force either way.
+_EARLY_STORE_ENV = os.environ.get("AITER_QUANT_EARLY_STORE")
+_EARLY_PAYLOAD_STORE = None if _EARLY_STORE_ENV is None else _EARLY_STORE_ENV == "1"
 
 # Architectures with native scaled-pack f32->fp4/fp8 conversion
 # (``v_cvt_scalef32_pk_{fp4,fp8}_f32``). On these the per-block pack folds the
@@ -324,6 +347,19 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             num_records_bytes=c.src_scale_bytes_per_row,
         )
 
+    # Holding every block_iters payload live until the store pass costs one
+    # register each, which at 224 blocks per row is enough to cut occupancy.
+    # Retiring them at conversion wins that back, but only with a single
+    # destination: the scattered path stores the same value once per route, and
+    # moving all of those into the quant pass breaks up its load clustering for
+    # the same register saving (measured 33.7 -> 25.9 us compact, 78.1 -> 80.1
+    # scattered, at 16384 tokens).
+    early_payload_store = (
+        len(dst_payload) == 1
+        if _EARLY_PAYLOAD_STORE is None
+        else _EARLY_PAYLOAD_STORE
+    )
+
     quant_results = []
     for it in range_constexpr(c.block_iters):
         # MX block (along K) this lane works on this iteration.
@@ -474,7 +510,22 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                     packed_byte = ArithValue(nib0) | (ArithValue(nib1) << c.c4_i32)
                     payload_val = arith.trunci(T.i8, packed_byte)  # 1 fp4x2 B
 
-        quant_results.append((mx_block, payload_val, e8m0_scale))
+        if const_expr(early_payload_store):
+            # Retire the payload here instead of holding all block_iters of them
+            # live until the store pass. The store is branch-free, so the quant
+            # pass stays one basic block and its loads still cluster; only the
+            # scale, which needs a lead-lane branch, has to wait.
+            for payload_rsrc in dst_payload:
+                buffer_ops.buffer_store(
+                    payload_val,
+                    payload_rsrc,
+                    mx_block * c.c_payload_bytes_per_block
+                    + c.lane_in_block * c.c_payload_bytes_per_lane,
+                    offset_is_bytes=True,
+                )
+            quant_results.append((mx_block, None, e8m0_scale))
+        else:
+            quant_results.append((mx_block, payload_val, e8m0_scale))
 
     # Stores are a separate pass so the quant pass above stays one basic block and
     # its loads can cluster. That only works while the quant pass is branch-free:
@@ -492,14 +543,15 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
         scale_dword = fx.Uint32(mx_block) // fx.Uint32(c.c4_i32)
         byte_in_dword = mx_block - scale_dword * c.c4_i32
         e8m0_byte = arith.trunci(T.i8, e8m0_scale)
-        for payload_rsrc in dst_payload:
-            payload_byte_off = (
-                mx_block * c.c_payload_bytes_per_block
-                + c.lane_in_block * c.c_payload_bytes_per_lane
-            )
-            buffer_ops.buffer_store(
-                payload_val, payload_rsrc, payload_byte_off, offset_is_bytes=True
-            )
+        if const_expr(not early_payload_store):
+            for payload_rsrc in dst_payload:
+                payload_byte_off = (
+                    mx_block * c.c_payload_bytes_per_block
+                    + c.lane_in_block * c.c_payload_bytes_per_lane
+                )
+                buffer_ops.buffer_store(
+                    payload_val, payload_rsrc, payload_byte_off, offset_is_bytes=True
+                )
 
         # one e8m0 byte per block, written by the block's lead lane. Every
         # destination shares this single branch: one scf.if each makes the
@@ -510,9 +562,14 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
         _if_lead = scf.IfOp(_raw(c.is_block_lead))
         with ir.InsertionPoint(_if_lead.then_block):
             for dst, scale_rsrc in zip(c.dests, dst_scale_rsrc):
-                dst_scale_dword = (
-                    dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
-                )
+                if const_expr(getattr(dst, "scale_row_major", False)):
+                    # Row-major: a row's scale dwords are adjacent, so the 224 B
+                    # of one token land in 4 cache lines instead of 56.
+                    dst_scale_dword = dst.scale_row_dword_base + scale_dword
+                else:
+                    dst_scale_dword = (
+                        dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
+                    )
                 dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
                 buffer_ops.buffer_store(e8m0_byte, scale_rsrc, dst_scale_byte)
             scf.YieldOp([])
@@ -1408,6 +1465,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
     mx_blocks_per_row = L.mx_blocks_per_row
     rows_per_tile = L.rows_per_tile
+    scale_dwords_per_row = L.scale_dwords_per_row
     dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
@@ -1481,6 +1539,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
+        c_scale_dwords_per_row = arith.constant(scale_dwords_per_row, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
@@ -1528,7 +1587,29 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 is_block_lead = lane_in_block == c0_i32
 
                 dests = []
-                for k in range_constexpr(source_topk):
+                if const_expr(_COMPACT_A):
+                    # One row per token: the route -> row indirection moves to
+                    # the GEMM, which gathers by topids_to_rows. A zero-length
+                    # scale descriptor parks the scale half on the scattered
+                    # destinations below when only the payload is compacted.
+                    dests.append(
+                        SimpleNamespace(
+                            payload_row_i32=src_token,
+                            scale_row_dword_base=fx.Uint32(src_token)
+                            * fx.Uint32(c_scale_dwords_per_row),
+                            payload_records=fx.Int32(payload_bytes_per_row),
+                            scale_row_major=True,
+                            scale_rsrc=buffer_ops.create_buffer_resource_from_addr(
+                                scale_base,
+                                num_records_bytes=fx.Int32(
+                                    SCALE_RSRC_MAX_BYTES if _COMPACT_SCALE else 0
+                                ),
+                            ),
+                        )
+                    )
+                # Still needed when only the payload is compact: these carry the
+                # scale, with their payload descriptors zeroed out.
+                for k in range_constexpr(0 if _COMPACT_SCALE else source_topk):
                     route_k = src_token * c_source_topk + arith.constant(k, type=i32)
                     # Scalar (SMEM) load, same reason as the single-dest path:
                     # a uniform row keeps the destination descriptor uniform.
@@ -1551,8 +1632,12 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                                 + wmma_row * c16_i32
                                 + row_lane16
                             ),
-                            payload_records=mapped_k.select(
-                                fx.Int32(payload_bytes_per_row), fx.Int32(0)
+                            payload_records=(
+                                fx.Int32(0)
+                                if const_expr(_COMPACT_A)
+                                else mapped_k.select(
+                                    fx.Int32(payload_bytes_per_row), fx.Int32(0)
+                                )
                             ),
                             scale_rsrc=buffer_ops.create_buffer_resource_from_addr(
                                 scale_base,
