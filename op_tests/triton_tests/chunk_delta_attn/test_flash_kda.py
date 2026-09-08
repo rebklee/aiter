@@ -349,15 +349,15 @@ def test_tuner_keeps_the_two_schedules_apart():
     kw = {"initial_state": torch.zeros(1, 4, K_DIM, K_DIM, device=device)}
     # This is about the Triton kernel's autotuner, which never runs -- and whose
     # cache therefore stays empty -- when K2 is routed to Gluon.
-    saved = _flash_kda.AITER_FLASH_KDA_USE_GLUON_K2
-    _flash_kda.AITER_FLASH_KDA_USE_GLUON_K2 = False
+    saved = _flash_kda.AITER_FDA_USE_GLUON_K2
+    _flash_kda.AITER_FDA_USE_GLUON_K2 = False
     try:
         kern.cache.clear()
         run_flash(*args, chunks_per_seg=4, **kw)
         segmented_keys = set(kern.cache)
         run_flash(*args, chunks_per_seg=0, **kw)
     finally:
-        _flash_kda.AITER_FLASH_KDA_USE_GLUON_K2 = saved
+        _flash_kda.AITER_FDA_USE_GLUON_K2 = saved
     assert set(kern.cache) - segmented_keys, "unsegmented reused a segmented config"
 
 

@@ -66,6 +66,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.fast_launch import fast_l
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
+from aiter.ops.triton.utils._triton import arch_info
 
 # On by default. `flash_kda_supported` decides per call and anything outside the
 # restrictions above keeps the default pipeline, so this switch only exists to
@@ -75,16 +76,26 @@ CHUNK_DELTA_ATTN_USE_FLASH_KDA: bool = os.getenv(
     "CHUNK_DELTA_ATTN_USE_FLASH_KDA", "1"
 ).lower() in ("1", "true", "yes", "on")
 
-# Off by default: routes K1 and/or K2 to the Gluon transcriptions under
+# On by default: routes K1 and/or K2 to the Gluon transcriptions under
 # _gluon_kernels. "1" takes both, "k1" or "k2" takes one, which is what
-# attributes an end-to-end change to a single kernel. Both are fixed to C == 32
-# and K == 128 by the layouts they transcribe, so each is gated per call and
-# anything else still runs the Triton kernel; the two write the same ABI, so
-# neither side knows which one ran.
-_GLUON_SEL: str = os.getenv("AITER_FLASH_KDA_USE_GLUON", "0").lower()
+# attributes an end-to-end change to a single kernel, and "0" backs out to the
+# Triton kernels. Both are fixed to C == 32, K == 128 and gfx950 by the layouts
+# and cdna4 intrinsics they transcribe, so each is gated per call and anything
+# else still runs the Triton kernel; the two write the same ABI, so neither side
+# knows which one ran.
+_GLUON_SEL: str = os.getenv("AITER_FDA_USE_GLUON", "1").lower()
 _GLUON_BOTH: bool = _GLUON_SEL in ("1", "true", "yes", "on", "all")
-AITER_FLASH_KDA_USE_GLUON_K1: bool = _GLUON_BOTH or _GLUON_SEL == "k1"
-AITER_FLASH_KDA_USE_GLUON_K2: bool = _GLUON_BOTH or _GLUON_SEL == "k2"
+AITER_FDA_USE_GLUON_K1: bool = _GLUON_BOTH or _GLUON_SEL == "k1"
+AITER_FDA_USE_GLUON_K2: bool = _GLUON_BOTH or _GLUON_SEL == "k2"
+
+# Both modules reach for `gl.amd.cdna4` mfma and buffer ops by name, so gfx950 is
+# not a preference here -- anything else fails to compile. Only load-bearing
+# because the switch above defaults to on: without it a gfx942 host would route
+# into them the moment the tile shape matched.
+DEVICE_ARCH = arch_info.get_arch()
+_GLUON_ARCH_OK: bool = DEVICE_ARCH == "gfx950"
+
+_LOGGED_ROUTES: set = set()
 
 # The K-dimension is consumed as two 64-wide halves so the recurrent state fits
 # a pair of [64, BW] register tiles in K2. Relaxing this means reworking K2's
@@ -658,18 +669,45 @@ def flash_kda_supported(
 def _gluon_k1_usable(C: int, K: int) -> bool:
     """Whether the Gluon K1 can stand in for the Triton one on this call.
 
-    Only the tile shape is left: the kernel asserts C == 32 and K == 128 because
-    its layouts are transcribed at that shape, and neither is reachable from the
-    other by a constexpr. Varlen, short trailing chunks and a missing dt_bias
-    are all handled. Kept here rather than in that module so deciding costs no
-    gluon import.
+    Past the arch, only the tile shape is left: the kernel asserts C == 32 and
+    K == 128 because its layouts are transcribed at that shape, and neither is
+    reachable from the other by a constexpr. Varlen, short trailing chunks and a
+    missing dt_bias are all handled. Kept here rather than in that module so
+    deciding costs no gluon import.
     """
-    return C == FLASH_KDA_CHUNK and K == FLASH_KDA_K
+    return _GLUON_ARCH_OK and C == FLASH_KDA_CHUNK and K == FLASH_KDA_K
 
 
 def _gluon_k2_usable(C: int, K: int, V: int) -> bool:
     """Whether the Gluon K2 can stand in for the Triton one on this call."""
-    return C == FLASH_KDA_CHUNK and K == FLASH_KDA_K and V == FLASH_KDA_K
+    return (
+        _GLUON_ARCH_OK
+        and C == FLASH_KDA_CHUNK
+        and K == FLASH_KDA_K
+        and V == FLASH_KDA_K
+    )
+
+
+def _log_route(k1_gluon: bool, k2_gluon: bool, C: int, K: int, V: int) -> None:
+    """Print which implementation each of K1 and K2 resolved to, once per answer.
+
+    TEMPORARY, and unconditional on purpose: the point is to see the route in a
+    model run without setting anything up first. The choice is invisible by
+    construction -- both sides write the same ABI -- so there is otherwise
+    nothing to see short of reading kernel names out of a profiler. Deduped on
+    the decision because decode reaches here once per step with the answer fixed
+    after the first, so this stays at a handful of lines per process.
+    """
+    key = (k1_gluon, k2_gluon, C, K, V)
+    if key in _LOGGED_ROUTES:
+        return
+    _LOGGED_ROUTES.add(key)
+    print(
+        f"[flash_kda] route: K1={'gluon' if k1_gluon else 'triton'} "
+        f"K2={'gluon' if k2_gluon else 'triton'} "
+        f"(C={C} K={K} V={V} arch={DEVICE_ARCH})",
+        flush=True,
+    )
 
 
 def _choose_k2_bw(W: int, num_segs: int, H: int) -> int:
@@ -930,7 +968,8 @@ def flash_kda_fwd(
     # here for the same reason.
     ws_inv_mqk = torch.empty(H * total_tiles, 2 * C, C, dtype=torch.float16, device=dev)
 
-    if AITER_FLASH_KDA_USE_GLUON_K1 and _gluon_k1_usable(C, K):
+    use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
+    if use_gluon_k1:
         from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn.flash_kda_k1 import (
             gluon_k1_prepare,
         )
@@ -1042,7 +1081,8 @@ def flash_kda_fwd(
     # and there the register-resident state is at best a wash: it cannot be
     # warp-split along K, so its wave count is capped at ``W/16 * num_segs * H``
     # and an unsegmented shape ends up with half the parallelism Triton gets.
-    use_gluon_k2 = AITER_FLASH_KDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
+    use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
+    _log_route(use_gluon_k1, use_gluon_k2, C, K, V)
 
     def _launch_k2(*, W, **kw):
         return _segment_fast[
